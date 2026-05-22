@@ -12,20 +12,20 @@
             <img src="Logo Escuela.jpg" alt="Logo Institucional" class="school-logo">
         </div>
 
-        <form>
+        <form id="login-form">
             <div class="input-group">
                 <i class="fa-solid fa-at"></i>
-                <input type="text" placeholder="Usuario">
+                <input type="text" id="login-usuario" placeholder="Usuario">
             </div>
 
             <div class="input-group">
                 <i class="fa-regular fa-envelope"></i>
-                <input type="email" placeholder="Email ID">
+                <input type="email" id="login-email" placeholder="Email ID">
             </div>
 
             <div class="input-group">
                 <i class="fa-solid fa-lock"></i>
-                <input type="password" placeholder="Password">
+                <input type="password" id="login-password" placeholder="Password">
             </div>
 
             <div class="remember-me">
@@ -33,9 +33,10 @@
                 <label for="rem">Remember me</label>
             </div>
 
-            <a href="TU_PAGINA_AQUI.html" class="main-button">LOGIN</a>
+            <button type="submit" class="main-button" id="login-button">LOGIN</button>
         </form>
     </div>
 
+    <script src="login.js" defer></script>
 </body>
 </html>
