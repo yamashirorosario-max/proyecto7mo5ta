@@ -1,0 +1,521 @@
+Necesito un código de SQL para utilizar en PostgreSQL que genere una base de datos basada completamente en la base de datos DE LA IMAGEN. Si encuentras algo para corregir; explícame qué cambiaste y por qué. Hay que apuntar a que sea una base de datos eficiente para almacenar las asistencias tomadas a través de un sistema NFC en la puerta de un colegio y luego mostrar las asistencias de cada alumno en una app web. 
+
+-- ============================================================
+--  BASE DE DATOS: Sistema de Asistencias NFC - Colegio
+--  Motor: PostgreSQL
+--  Descripción: Registra eventos de entrada/salida mediante NFC
+--               y expone asistencias por alumno para la app web.
+-- ============================================================
+
+
+-- ============================================================
+--  1. TIPOS ENUM
+--     PostgreSQL no tiene TINYINT ni ENUM "inline" como MySQL.
+--     Los ENUMs se declaran como tipos independientes.
+-- ============================================================
+
+CREATE TYPE tipo_evento_enum      AS ENUM ('entrada', 'salida');
+CREATE TYPE fuente_enum           AS ENUM ('nfc', 'qr', 'manual');
+CREATE TYPE estado_asistencia_enum AS ENUM ('presente', 'ausente', 'tardanza', 'justificado');
+
+
+-- ============================================================
+--  2. TURNOS
+--     TINYINT → SMALLINT (PostgreSQL no tiene TINYINT).
+--     GENERATED ALWAYS AS IDENTITY es el estándar SQL moderno
+--     (preferido sobre SERIAL en Postgres 10+).
+-- ============================================================
+
+CREATE TABLE turnos (
+    id          SMALLINT    PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    nombre      VARCHAR(20) NOT NULL,
+    hora_inicio TIME        NOT NULL,
+    hora_fin    TIME        NOT NULL
+);
+
+
+-- ============================================================
+--  3. CURSOS
+--     Se agrega UNIQUE(anio, division) para evitar duplicados
+--     lógicos (no puede existir dos veces "3°A").
+-- ============================================================
+
+CREATE TABLE cursos (
+    id       INT      PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    anio     SMALLINT NOT NULL CHECK (anio BETWEEN 1 AND 7),
+    division CHAR(1)  NOT NULL,
+    activo   BOOLEAN  NOT NULL DEFAULT TRUE,
+    UNIQUE (anio, division)
+);
+
+
+-- ============================================================
+--  4. PRECEPTORES
+--     Se agrega UNIQUE en email (necesario para login seguro).
+-- ============================================================
+
+CREATE TABLE preceptores (
+    id            INT          PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    nombre        VARCHAR(50)  NOT NULL,
+    apellido      VARCHAR(50)  NOT NULL,
+    email         VARCHAR(100) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL
+);
+
+
+-- ============================================================
+--  5. ALUMNOS
+--     - UNIQUE en dni, nfc_uid y qr_code: cada uno identifica
+--       unívocamente a un alumno; sin unicidad el lector NFC
+--       podría matchear más de uno.
+--     - nfc_uid y qr_code son NULLABLE para alumnos que aún
+--       no tienen tarjeta/QR asignado.
+--     - created_at con DEFAULT NOW() para auditoría.
+-- ============================================================
+
+CREATE TABLE alumnos (
+    id         INT          PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    nombre     VARCHAR(50)  NOT NULL,
+    apellido   VARCHAR(50)  NOT NULL,
+    dni        VARCHAR(10)  NOT NULL UNIQUE,
+    nfc_uid    VARCHAR(32)  UNIQUE,
+    qr_code    VARCHAR(64)  UNIQUE,
+    curso_id   INT          NOT NULL REFERENCES cursos(id),
+    activo     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+
+-- ============================================================
+--  6. PRECEPTOR_CURSO  (tabla de unión N:M)
+--     PK compuesta sobre ambas FKs.
+-- ============================================================
+
+CREATE TABLE preceptor_curso (
+    preceptor_id INT NOT NULL REFERENCES preceptores(id) ON DELETE CASCADE,
+    curso_id     INT NOT NULL REFERENCES cursos(id)      ON DELETE CASCADE,
+    PRIMARY KEY (preceptor_id, curso_id)
+);
+
+
+-- ============================================================
+--  7. EVENTOS_ACCESO
+--     Registro crudo de cada lectura NFC/QR en la puerta.
+--     - id → BIGINT: puede acumular millones de eventos al año.
+--     - Se usa TIMESTAMPTZ (con zona horaria) para evitar
+--       problemas con cambios de horario en Argentina (UTC-3).
+--     - turno_id es NULLABLE: el evento se puede registrar
+--       antes de determinar a qué turno corresponde.
+-- ============================================================
+
+CREATE TABLE eventos_acceso (
+    id          BIGINT              PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    alumno_id   INT                 NOT NULL REFERENCES alumnos(id),
+    ocurrido_at TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+    tipo_evento tipo_evento_enum    NOT NULL,
+    turno_id    SMALLINT            REFERENCES turnos(id),
+    fuente      fuente_enum         NOT NULL DEFAULT 'nfc'
+);
+
+
+-- ============================================================
+--  8. ASISTENCIAS
+--     Una fila por (alumno, fecha, turno): el estado consolidado
+--     que consume la app web.
+--     - UNIQUE(alumno_id, fecha, turno_id) impide duplicados.
+--     - hora_entrada / hora_salida son TIMESTAMPTZ para precisión.
+--     - updated_at se actualiza manualmente o con un trigger.
+-- ============================================================
+
+CREATE TABLE asistencias (
+    id            BIGINT                  PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    alumno_id     INT                     NOT NULL REFERENCES alumnos(id),
+    fecha         DATE                    NOT NULL DEFAULT CURRENT_DATE,
+    turno_id      SMALLINT                NOT NULL REFERENCES turnos(id),
+    estado        estado_asistencia_enum  NOT NULL DEFAULT 'ausente',
+    hora_entrada  TIMESTAMPTZ,
+    hora_salida   TIMESTAMPTZ,
+    justificacion TEXT,
+    updated_at    TIMESTAMPTZ             NOT NULL DEFAULT NOW(),
+    UNIQUE (alumno_id, fecha, turno_id)
+);
+
+
+-- ============================================================
+--  9. TRIGGER: actualizar updated_at automáticamente
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_asistencias_updated_at
+BEFORE UPDATE ON asistencias
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+
+-- ============================================================
+--  10. ÍNDICES DE RENDIMIENTO
+--      Orientados a las consultas más frecuentes de la app web.
+-- ============================================================
+
+-- Consultas de asistencia por alumno y rango de fechas
+CREATE INDEX idx_asistencias_alumno_fecha
+    ON asistencias (alumno_id, fecha DESC);
+
+-- Filtrar asistencias por curso (JOIN alumnos → cursos)
+CREATE INDEX idx_asistencias_fecha
+    ON asistencias (fecha DESC);
+
+-- Lookup NFC en la puerta: la consulta más crítica en latencia
+CREATE INDEX idx_alumnos_nfc_uid
+    ON alumnos (nfc_uid)
+    WHERE nfc_uid IS NOT NULL;
+
+-- Lookup por QR
+CREATE INDEX idx_alumnos_qr_code
+    ON alumnos (qr_code)
+    WHERE qr_code IS NOT NULL;
+
+-- Alumnos por curso (listados y reportes)
+CREATE INDEX idx_alumnos_curso
+    ON alumnos (curso_id)
+    WHERE activo = TRUE;
+
+-- Eventos históricos por alumno
+CREATE INDEX idx_eventos_alumno_at
+    ON eventos_acceso (alumno_id, ocurrido_at DESC);
+
+-- Auditoría temporal de eventos
+CREATE INDEX idx_eventos_at
+    ON eventos_acceso (ocurrido_at DESC);
+
+
+-- ============================================================
+--  11. VISTA: asistencias enriquecidas para la app web
+--      Evita hacer JOINs repetitivos en el backend.
+-- ============================================================
+
+CREATE VIEW v_asistencias_detalle AS
+SELECT
+    a.id,
+    al.id           AS alumno_id,
+    al.apellido,
+    al.nombre,
+    al.dni,
+    c.anio          AS curso_anio,
+    c.division      AS curso_division,
+    t.nombre        AS turno,
+    a.fecha,
+    a.estado,
+    a.hora_entrada,
+    a.hora_salida,
+    a.justificacion,
+    a.updated_at
+FROM asistencias      a
+JOIN alumnos          al ON al.id = a.alumno_id
+JOIN cursos           c  ON c.id  = al.curso_id
+JOIN turnos           t  ON t.id  = a.turno_id
+ORDER BY a.fecha DESC, al.apellido, al.nombre;
+
+
+-- ============================================================
+--  12. DATOS SEMILLA (opcional, para arrancar el sistema)
+-- ============================================================
+
+INSERT INTO turnos (nombre, hora_inicio, hora_fin) VALUES
+    ('Mañana',  '07:00', '13:00'),
+    ('Tarde',   '13:00', '18:00'),
+    ('Vespert.','18:00', '22:00');
+
+
+
+
+
+
+
+
+
+
+
+
+SEGUNDO CODIGO
+
+-- ============================================================
+--  BASE DE DATOS: Sistema de Asistencias NFC - Colegio
+--  Motor: PostgreSQL
+--  Descripción: Registra eventos de entrada/salida mediante NFC
+--               y expone asistencias por alumno para la app web.
+-- ============================================================
+
+
+-- ============================================================
+--  1. TIPOS ENUM
+--     PostgreSQL no tiene TINYINT ni ENUM "inline" como MySQL.
+--     Los ENUMs se declaran como tipos independientes.
+-- ============================================================
+
+CREATE TYPE tipo_evento_enum       AS ENUM ('entrada', 'salida');
+CREATE TYPE fuente_enum            AS ENUM ('nfc', 'qr', 'manual');
+CREATE TYPE estado_asistencia_enum AS ENUM ('presente', 'ausente', 'tardanza', 'justificado');
+
+
+-- ============================================================
+--  2. TURNOS
+--     TINYINT → SMALLINT (PostgreSQL no tiene TINYINT).
+--     GENERATED ALWAYS AS IDENTITY es el estándar SQL moderno
+--     (preferido sobre SERIAL en Postgres 10+).
+-- ============================================================
+
+CREATE TABLE turnos (
+    id          SMALLINT    PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    nombre      VARCHAR(20) NOT NULL,
+    hora_inicio TIME        NOT NULL,
+    hora_fin    TIME        NOT NULL,
+    -- [FIX #6] Auditoría consistente en todas las tablas
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+-- ============================================================
+--  3. CURSOS
+--     Se agrega UNIQUE(anio, division) para evitar duplicados
+--     lógicos (no puede existir dos veces "3°A").
+-- ============================================================
+
+CREATE TABLE cursos (
+    id       INT      PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    anio     SMALLINT NOT NULL CHECK (anio BETWEEN 1 AND 7),
+    division CHAR(1)  NOT NULL,
+    activo   BOOLEAN  NOT NULL DEFAULT TRUE,
+    -- [FIX #6] Auditoría consistente en todas las tablas
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (anio, division)
+);
+
+
+-- ============================================================
+--  4. PRECEPTORES
+--     Se agrega UNIQUE en email (necesario para login seguro).
+-- ============================================================
+
+CREATE TABLE preceptores (
+    id            INT          PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    nombre        VARCHAR(50)  NOT NULL,
+    apellido      VARCHAR(50)  NOT NULL,
+    email         VARCHAR(100) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    -- [FIX #6] Auditoría consistente en todas las tablas
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+
+-- ============================================================
+--  5. ALUMNOS
+--     - UNIQUE en dni, nfc_uid y qr_code: cada uno identifica
+--       unívocamente a un alumno; sin unicidad el lector NFC
+--       podría matchear más de uno.
+--     - nfc_uid y qr_code son NULLABLE para alumnos que aún
+--       no tienen tarjeta/QR asignado.
+--     - created_at con DEFAULT NOW() para auditoría.
+-- ============================================================
+
+CREATE TABLE alumnos (
+    id         INT          PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    nombre     VARCHAR(50)  NOT NULL,
+    apellido   VARCHAR(50)  NOT NULL,
+    dni        VARCHAR(10)  NOT NULL UNIQUE,
+    nfc_uid    VARCHAR(32)  UNIQUE,
+    qr_code    VARCHAR(64)  UNIQUE,
+    -- [FIX #3] ON DELETE RESTRICT explícito para claridad
+    curso_id   INT          NOT NULL REFERENCES cursos(id) ON DELETE RESTRICT,
+    activo     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+
+-- ============================================================
+--  6. PRECEPTOR_CURSO  (tabla de unión N:M)
+--     PK compuesta sobre ambas FKs.
+-- ============================================================
+
+CREATE TABLE preceptor_curso (
+    preceptor_id INT NOT NULL REFERENCES preceptores(id) ON DELETE CASCADE,
+    curso_id     INT NOT NULL REFERENCES cursos(id)      ON DELETE CASCADE,
+    -- [FIX #6] Útil saber cuándo se asignó el preceptor al curso
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (preceptor_id, curso_id)
+);
+
+
+-- ============================================================
+--  7. EVENTOS_ACCESO
+--     Registro crudo de cada lectura NFC/QR en la puerta.
+--     - id → BIGINT: puede acumular millones de eventos al año.
+--     - Se usa TIMESTAMPTZ (con zona horaria) para evitar
+--       problemas con cambios de horario en Argentina (UTC-3).
+--     - turno_id es NULLABLE: el evento se puede registrar
+--       antes de determinar a qué turno corresponde.
+-- ============================================================
+
+CREATE TABLE eventos_acceso (
+    id          BIGINT           PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    -- [FIX #3] ON DELETE RESTRICT explícito: no eliminar alumnos con eventos
+    alumno_id   INT              NOT NULL REFERENCES alumnos(id) ON DELETE RESTRICT,
+    ocurrido_at TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    tipo_evento tipo_evento_enum NOT NULL,
+    -- [FIX #3] ON DELETE RESTRICT explícito
+    turno_id    SMALLINT         REFERENCES turnos(id) ON DELETE RESTRICT,
+    fuente      fuente_enum      NOT NULL DEFAULT 'nfc'
+);
+
+
+-- ============================================================
+--  8. ASISTENCIAS
+--     Una fila por (alumno, fecha, turno): el estado consolidado
+--     que consume la app web.
+--     - UNIQUE(alumno_id, fecha, turno_id) impide duplicados.
+--     - hora_entrada / hora_salida son TIMESTAMPTZ para precisión.
+--     - updated_at se actualiza con un trigger.
+--     [FIX #5] CHECKs para garantizar coherencia entre fecha
+--     y los timestamps de entrada/salida (zona Argentina UTC-3).
+-- ============================================================
+
+CREATE TABLE asistencias (
+    id            BIGINT                 PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    -- [FIX #3] ON DELETE RESTRICT explícito
+    alumno_id     INT                    NOT NULL REFERENCES alumnos(id)  ON DELETE RESTRICT,
+    fecha         DATE                   NOT NULL DEFAULT CURRENT_DATE,
+    -- [FIX #3] ON DELETE RESTRICT explícito
+    turno_id      SMALLINT               NOT NULL REFERENCES turnos(id)   ON DELETE RESTRICT,
+    estado        estado_asistencia_enum NOT NULL DEFAULT 'ausente',
+    hora_entrada  TIMESTAMPTZ,
+    hora_salida   TIMESTAMPTZ,
+    justificacion TEXT,
+    updated_at    TIMESTAMPTZ            NOT NULL DEFAULT NOW(),
+    UNIQUE (alumno_id, fecha, turno_id),
+    -- [FIX #5] hora_entrada debe corresponder al mismo día que fecha
+    CONSTRAINT chk_hora_entrada_fecha
+        CHECK (
+            hora_entrada IS NULL OR
+            DATE(hora_entrada AT TIME ZONE 'America/Argentina/Buenos_Aires') = fecha
+        ),
+    -- [FIX #5] hora_salida debe corresponder al mismo día que fecha
+    CONSTRAINT chk_hora_salida_fecha
+        CHECK (
+            hora_salida IS NULL OR
+            DATE(hora_salida AT TIME ZONE 'America/Argentina/Buenos_Aires') = fecha
+        ),
+    -- hora_salida no puede ser anterior a hora_entrada
+    CONSTRAINT chk_salida_posterior_entrada
+        CHECK (hora_salida IS NULL OR hora_entrada IS NULL OR hora_salida >= hora_entrada)
+);
+
+
+-- ============================================================
+--  9. TRIGGER: actualizar updated_at automáticamente
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_asistencias_updated_at
+BEFORE UPDATE ON asistencias
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+
+-- ============================================================
+--  10. ÍNDICES DE RENDIMIENTO
+--      Orientados a las consultas más frecuentes de la app web.
+-- ============================================================
+
+-- Consultas de asistencia por alumno y rango de fechas
+CREATE INDEX idx_asistencias_alumno_fecha
+    ON asistencias (alumno_id, fecha DESC);
+
+-- [FIX #2] Comentario corregido: este índice sirve para rangos de
+-- fecha globales (reportes, auditorías). El filtro por curso
+-- se resuelve vía idx_alumnos_curso + JOIN, no aquí.
+CREATE INDEX idx_asistencias_fecha
+    ON asistencias (fecha DESC);
+
+-- Lookup NFC en la puerta: la consulta más crítica en latencia
+CREATE INDEX idx_alumnos_nfc_uid
+    ON alumnos (nfc_uid)
+    WHERE nfc_uid IS NOT NULL;
+
+-- Lookup por QR
+CREATE INDEX idx_alumnos_qr_code
+    ON alumnos (qr_code)
+    WHERE qr_code IS NOT NULL;
+
+-- Alumnos por curso (listados y reportes)
+CREATE INDEX idx_alumnos_curso
+    ON alumnos (curso_id)
+    WHERE activo = TRUE;
+
+-- Eventos históricos por alumno
+CREATE INDEX idx_eventos_alumno_at
+    ON eventos_acceso (alumno_id, ocurrido_at DESC);
+
+-- Auditoría temporal de eventos
+CREATE INDEX idx_eventos_at
+    ON eventos_acceso (ocurrido_at DESC);
+
+-- [FIX #4] Búsqueda inversa: preceptores asignados a un curso dado
+CREATE INDEX idx_preceptor_curso_curso
+    ON preceptor_curso (curso_id);
+
+
+-- ============================================================
+--  11. VISTA: asistencias enriquecidas para la app web
+--      Evita hacer JOINs repetitivos en el backend.
+--      [FIX #1] Se elimina ORDER BY: en PostgreSQL el ORDER BY
+--      dentro de una vista no tiene efecto garantizado; el orden
+--      debe aplicarse en la query que consume la vista.
+-- ============================================================
+
+CREATE VIEW v_asistencias_detalle AS
+SELECT
+    a.id,
+    al.id           AS alumno_id,
+    al.apellido,
+    al.nombre,
+    al.dni,
+    c.anio          AS curso_anio,
+    c.division      AS curso_division,
+    t.nombre        AS turno,
+    a.fecha,
+    a.estado,
+    a.hora_entrada,
+    a.hora_salida,
+    a.justificacion,
+    a.updated_at
+FROM asistencias      a
+JOIN alumnos          al ON al.id = a.alumno_id
+JOIN cursos           c  ON c.id  = al.curso_id
+JOIN turnos           t  ON t.id  = a.turno_id;
+
+-- Uso recomendado al consumir la vista:
+-- SELECT * FROM v_asistencias_detalle
+-- WHERE fecha = CURRENT_DATE
+-- ORDER BY fecha DESC, apellido, nombre;
+
+
+-- ============================================================
+--  12. DATOS SEMILLA (opcional, para arrancar el sistema)
+-- ============================================================
+
+INSERT INTO turnos (nombre, hora_inicio, hora_fin) VALUES
+    ('Mañana',   '07:00', '13:00'),
+    ('Tarde',    '13:00', '18:00'),
+    ('Vespert.', '18:00', '22:00');
